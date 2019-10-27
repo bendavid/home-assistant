@@ -1,9 +1,14 @@
 """Support for interface with an LG webOS Smart TV."""
+from functools import wraps
 import asyncio
 from datetime import timedelta
 import logging
 from urllib.parse import urlparse
 from typing import Dict
+from websockets.exceptions import ConnectionClosed
+
+from pylgtv import WebOsClient
+from pylgtv import PyLGTVPairException, PyLGTVCmdException
 
 import voluptuous as vol
 
@@ -22,6 +27,7 @@ from homeassistant.components.media_player.const import (
     SUPPORT_VOLUME_MUTE,
     SUPPORT_VOLUME_SET,
     SUPPORT_VOLUME_STEP,
+    SUPPORT_COMMAND,
 )
 from homeassistant.const import (
     CONF_CUSTOMIZE,
@@ -35,6 +41,7 @@ from homeassistant.const import (
 )
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.script import Script
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
 _CONFIGURING: Dict[str, str] = {}
 _LOGGER = logging.getLogger(__name__)
@@ -58,6 +65,7 @@ SUPPORT_WEBOSTV = (
     | SUPPORT_SELECT_SOURCE
     | SUPPORT_PLAY_MEDIA
     | SUPPORT_PLAY
+    | SUPPORT_COMMAND
 )
 
 MIN_TIME_BETWEEN_SCANS = timedelta(seconds=10)
@@ -74,12 +82,12 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_HOST): cv.string,
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_ON_ACTION): cv.SCRIPT_SCHEMA,
-        vol.Optional(CONF_TIMEOUT, default=8): cv.positive_int,
+        vol.Optional(CONF_TIMEOUT, default=1): cv.positive_int,
     }
 )
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the LG WebOS TV platform."""
     if discovery_info is not None:
         host = urlparse(discovery_info[1]).hostname
@@ -101,77 +109,88 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
 
     config = hass.config.path(config.get(CONF_FILENAME))
 
-    setup_tv(host, name, customize, config, timeout, hass, add_entities, turn_on_action)
+    await async_setup_tv(
+        host, name, customize, config, timeout, hass, async_add_entities, turn_on_action
+    )
 
 
-def setup_tv(
-    host, name, customize, config, timeout, hass, add_entities, turn_on_action
+async def async_setup_tv(
+    host, name, customize, config, timeout, hass, async_add_entities, turn_on_action
 ):
     """Set up a LG WebOS TV based on host parameter."""
-    from pylgtv import WebOsClient
-    from pylgtv import PyLGTVPairException
-    from websockets.exceptions import ConnectionClosed
 
-    client = WebOsClient(host, config, timeout)
+    # client = WebOsClient(host, config, timeout)
+    device = LgWebOSDevice(host, name, customize, config, timeout, hass, turn_on_action)
 
-    if not client.is_registered():
+    if not device._client.is_registered():
+        _LOGGER.warning("Not Paired")
         if host in _CONFIGURING:
             # Try to pair.
             try:
-                client.register()
+                await device._client.connect()
+                await device._client.disconnect()
             except PyLGTVPairException:
                 _LOGGER.warning("Connected to LG webOS TV %s but not paired", host)
                 return
-            except (OSError, ConnectionClosed, asyncio.TimeoutError):
+            except (
+                OSError,
+                ConnectionClosed,
+                ConnectionRefusedError,
+                asyncio.TimeoutError,
+                asyncio.CancelledError,
+                PyLGTVCmdException,
+            ):
                 _LOGGER.error("Unable to connect to host %s", host)
                 return
         else:
             # Not registered, request configuration.
             _LOGGER.warning("LG webOS TV %s needs to be paired", host)
-            request_configuration(
+            await async_request_configuration(
                 host,
                 name,
                 customize,
                 config,
                 timeout,
                 hass,
-                add_entities,
+                async_add_entities,
                 turn_on_action,
             )
             return
 
     # If we came here and configuring this host, mark as done.
-    if client.is_registered() and host in _CONFIGURING:
+    if device._client.is_registered() and host in _CONFIGURING:
         request_id = _CONFIGURING.pop(host)
         configurator = hass.components.configurator
-        configurator.request_done(request_id)
+        configurator.async_request_done(request_id)
 
-    add_entities(
-        [LgWebOSDevice(host, name, customize, config, timeout, hass, turn_on_action)],
-        True,
-    )
+    device.setup()
+    async_add_entities([device], update_before_add=True)
 
 
-def request_configuration(
+async def async_request_configuration(
     host, name, customize, config, timeout, hass, add_entities, turn_on_action
 ):
     """Request configuration steps from the user."""
     configurator = hass.components.configurator
 
+    _LOGGER.warning("request configuration")
+
     # We got an error if this method is called while we are configuring
     if host in _CONFIGURING:
-        configurator.notify_errors(
+        _LOGGER.warning("host in configuring")
+        await configurator.async_notify_errors(
             _CONFIGURING[host], "Failed to pair, please try again."
         )
         return
 
-    def lgtv_configuration_callback(data):
+    async def lgtv_configuration_callback(data):
         """Handle actions when configuration callback is called."""
-        setup_tv(
+        await async_setup_tv(
             host, name, customize, config, timeout, hass, add_entities, turn_on_action
         )
 
-    _CONFIGURING[host] = configurator.request_config(
+    _LOGGER.warning("adding host to configuring")
+    _CONFIGURING[host] = configurator.async_request_config(
         name,
         lgtv_configuration_callback,
         description="Click start and accept the pairing request on your TV.",
@@ -180,12 +199,37 @@ def request_configuration(
     )
 
 
+def cmd(func):
+    """Catch command exceptions."""
+
+    @wraps(func)
+    async def wrapper(obj, *args, **kwargs):
+        """Wrap all command methods."""
+        try:
+            await func(obj, *args, **kwargs)
+        except (
+            asyncio.TimeoutError,
+            asyncio.CancelledError,
+            PyLGTVCmdException,
+        ) as exc:
+            # If TV is off, we expect calls to fail.
+            if obj.state == STATE_OFF:
+                log_function = _LOGGER.info
+            else:
+                log_function = _LOGGER.error
+            log_function(
+                "Error calling %s on entity %s: %r", func.__name__, obj.entity_id, exc
+            )
+
+    return wrapper
+
+
 class LgWebOSDevice(MediaPlayerDevice):
     """Representation of a LG WebOS TV."""
 
     def __init__(self, host, name, customize, config, timeout, hass, on_action):
         """Initialize the webos device."""
-        from pylgtv import WebOsClient
+        self.hass = hass
 
         self._client = WebOsClient(host, config, timeout)
         self._on_script = Script(hass, on_action) if on_action else None
@@ -202,65 +246,176 @@ class LgWebOSDevice(MediaPlayerDevice):
         self._state = None
         self._source_list = {}
         self._app_list = {}
+        self._input_list = {}
         self._channel = None
         self._last_icon = None
 
-    @util.Throttle(MIN_TIME_BETWEEN_SCANS, MIN_TIME_BETWEEN_FORCED_SCANS)
-    def update(self):
-        """Retrieve the latest data."""
-        from websockets.exceptions import ConnectionClosed
+    @property
+    def should_poll(self):
+        """Only poll for state when client is not connected."""
+        return not self._client.is_connected()
 
-        try:
-            current_input = self._client.get_input()
-            if current_input is not None:
-                self._current_source_id = current_input
-                if self._state in (None, STATE_OFF):
+    def setup(self):
+        """Listen for Home Assistant stop event."""
+
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.disconnect)
+
+    async def disconnect(self, event):
+        """Disconnect from TV."""
+        await self._client.disconnect()
+
+    async def async_subscribe_input_callback(self, current_input):
+        """Handle subscribed updates to current input."""
+        self._current_source_id = current_input
+
+        if self._current_source_id == "":
+            self._state = STATE_OFF
+        else:
+            self._state = STATE_PLAYING
+
+        self.update_sources()
+
+        if self.entity_id is not None:
+            self.async_schedule_update_ha_state(False)
+
+    async def async_subscribe_muted_callback(self, muted):
+        """Handle subscribed updates to mute status."""
+        self._muted = muted
+
+        if self.entity_id is not None:
+            self.async_schedule_update_ha_state(False)
+
+    async def async_subscribe_volume_callback(self, volume):
+        """Handle subscribed updates to volume status."""
+        self._volume = volume
+        if self.entity_id is not None:
+            self.async_schedule_update_ha_state(False)
+
+    async def async_subscribe_current_channel_callback(self, channel):
+        """Handle subscribed updates to current channel."""
+        self._channel = channel
+        if self.entity_id is not None:
+            self.async_schedule_update_ha_state(False)
+
+    async def async_subscribe_apps_callback(self, apps):
+        """Handle subscribed updates to apps list."""
+        self._app_list = {}
+        for app in apps:
+            self._app_list[app["id"]] = app
+
+        self.update_sources()
+
+        if self.entity_id is not None:
+            self.async_schedule_update_ha_state(True)
+
+    async def async_subscribe_inputs_callback(self, inputs):
+        """Handle subscribed updates to inputs list."""
+        self._input_list = {}
+        for extinput in inputs:
+            self._input_list[extinput["label"]] = extinput
+
+        self.update_sources()
+
+        if self.entity_id is not None:
+            self.async_schedule_update_ha_state(True)
+
+    def update_sources(self):
+        """Update list of sources from current source, apps, inputs and configured list."""
+        self._source_list = {}
+        conf_sources = self._customize.get(CONF_SOURCES, [])
+
+        for app in self._app_list.values():
+            if app["id"] == self._current_source_id:
+                self._current_source = app["title"]
+                self._source_list[app["title"]] = app
+            elif (
+                not conf_sources
+                or app["id"] in conf_sources
+                or any(word in app["title"] for word in conf_sources)
+                or any(word in app["id"] for word in conf_sources)
+            ):
+                self._source_list[app["title"]] = app
+
+        for source in self._input_list.values():
+            if source["appId"] == self._current_source_id:
+                self._current_source = source["label"]
+                self._source_list[source["label"]] = source
+            elif (
+                not conf_sources
+                or source["label"] in conf_sources
+                or any(source["label"].find(word) != -1 for word in conf_sources)
+            ):
+                self._source_list[source["label"]] = source
+
+    @util.Throttle(MIN_TIME_BETWEEN_SCANS, MIN_TIME_BETWEEN_FORCED_SCANS)
+    async def async_update(self):
+        """Connect and initialize state and update subscriptions."""
+
+        if not self._client.is_connected():
+            try:
+                await self._client.connect()
+
+                # manually get state
+                results = await asyncio.gather(
+                    self._client.get_current_app(),
+                    self._client.get_muted(),
+                    self._client.get_volume(),
+                    self._client.get_current_channel(),
+                    self._client.get_apps(),
+                    self._client.get_inputs(),
+                )
+
+                self._current_source_id = results[0]
+
+                if self._current_source_id == "":
+                    self._state = STATE_OFF
+                else:
                     self._state = STATE_PLAYING
-            else:
+
+                self._muted = results[1]
+                self._volume = results[2]
+                self._channel = results[3]
+
+                self._app_list = {}
+                for app in results[4]:
+                    self._app_list[app["id"]] = app
+
+                self._input_list = {}
+                for extinput in results[5]:
+                    self._input_list[extinput["label"]] = extinput
+
+                self.update_sources()
+
+                # subscribe to updates
+                await self._client.subscribe_current_app(
+                    self.async_subscribe_input_callback
+                )
+                await self._client.subscribe_muted(self.async_subscribe_muted_callback)
+                await self._client.subscribe_volume(
+                    self.async_subscribe_volume_callback
+                )
+                await self._client.subscribe_current_channel(
+                    self.async_subscribe_current_channel_callback
+                )
+                await self._client.subscribe_apps(self.async_subscribe_apps_callback)
+                await self._client.subscribe_inputs(
+                    self.async_subscribe_inputs_callback
+                )
+            except (
+                OSError,
+                ConnectionClosed,
+                ConnectionRefusedError,
+                asyncio.TimeoutError,
+                asyncio.CancelledError,
+                PyLGTVPairException,
+                PyLGTVCmdException,
+            ):
+                if self._client.is_connected():
+                    await self._client.disconnect()
                 self._state = STATE_OFF
                 self._current_source = None
                 self._current_source_id = None
                 self._channel = None
-
-            if self._state is not STATE_OFF:
-                self._muted = self._client.get_muted()
-                self._volume = self._client.get_volume()
-                self._channel = self._client.get_current_channel()
-
-                self._source_list = {}
-                self._app_list = {}
-                conf_sources = self._customize.get(CONF_SOURCES, [])
-
-                for app in self._client.get_apps():
-                    self._app_list[app["id"]] = app
-                    if app["id"] == self._current_source_id:
-                        self._current_source = app["title"]
-                        self._source_list[app["title"]] = app
-                    elif (
-                        not conf_sources
-                        or app["id"] in conf_sources
-                        or any(word in app["title"] for word in conf_sources)
-                        or any(word in app["id"] for word in conf_sources)
-                    ):
-                        self._source_list[app["title"]] = app
-
-                for source in self._client.get_inputs():
-                    if source["id"] == self._current_source_id:
-                        self._current_source = source["label"]
-                        self._source_list[source["label"]] = source
-                    elif (
-                        not conf_sources
-                        or source["label"] in conf_sources
-                        or any(
-                            source["label"].find(word) != -1 for word in conf_sources
-                        )
-                    ):
-                        self._source_list[source["label"]] = source
-        except (OSError, ConnectionClosed, TypeError, asyncio.TimeoutError):
-            self._state = STATE_OFF
-            self._current_source = None
-            self._current_source_id = None
-            self._channel = None
 
     @property
     def name(self):
@@ -329,47 +484,53 @@ class LgWebOSDevice(MediaPlayerDevice):
             return SUPPORT_WEBOSTV | SUPPORT_TURN_ON
         return SUPPORT_WEBOSTV
 
-    def turn_off(self):
+    @cmd
+    async def async_turn_off(self):
         """Turn off media player."""
-        from websockets.exceptions import ConnectionClosed
-
-        self._state = STATE_OFF
         try:
-            self._client.power_off()
-        except (OSError, ConnectionClosed, TypeError, asyncio.TimeoutError):
+            await self._client.power_off()
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
 
-    def turn_on(self):
+        self._state = STATE_OFF
+
+    def async_turn_on(self):
         """Turn on the media player."""
         if self._on_script:
-            self._on_script.run()
+            return self._on_script.async_run()
 
-    def volume_up(self):
+    @cmd
+    async def async_volume_up(self):
         """Volume up the media player."""
-        self._client.volume_up()
+        await self._client.volume_up()
 
-    def volume_down(self):
+    @cmd
+    async def async_volume_down(self):
         """Volume down media player."""
-        self._client.volume_down()
+        await self._client.volume_down()
 
-    def set_volume_level(self, volume):
+    @cmd
+    def async_set_volume_level(self, volume):
         """Set volume level, range 0..1."""
         tv_volume = volume * 100
-        self._client.set_volume(tv_volume)
+        return self._client.set_volume(tv_volume)
 
-    def mute_volume(self, mute):
+    @cmd
+    def async_mute_volume(self, mute):
         """Send mute command."""
         self._muted = mute
-        self._client.set_mute(mute)
+        return self._client.set_mute(mute)
 
-    def media_play_pause(self):
+    @cmd
+    def async_media_play_pause(self):
         """Simulate play pause media player."""
         if self._playing:
-            self.media_pause()
+            return self.media_pause()
         else:
-            self.media_play()
+            return self.media_play()
 
-    def select_source(self, source):
+    @cmd
+    async def async_select_source(self, source):
         """Select input source."""
         source_dict = self._source_list.get(source)
         if source_dict is None:
@@ -378,12 +539,13 @@ class LgWebOSDevice(MediaPlayerDevice):
         self._current_source_id = source_dict["id"]
         if source_dict.get("title"):
             self._current_source = source_dict["title"]
-            self._client.launch_app(source_dict["id"])
+            await self._client.launch_app(source_dict["id"])
         elif source_dict.get("label"):
             self._current_source = source_dict["label"]
-            self._client.set_input(source_dict["id"])
+            await self._client.set_input(source_dict["id"])
 
-    def play_media(self, media_type, media_id, **kwargs):
+    @cmd
+    async def async_play_media(self, media_type, media_id, **kwargs):
         """Play a piece of media."""
         _LOGGER.debug("Call play media type <%s>, Id <%s>", media_type, media_id)
 
@@ -409,40 +571,50 @@ class LgWebOSDevice(MediaPlayerDevice):
                     "Switching to channel <%s> with perfect match",
                     perfect_match_channel_id,
                 )
-                self._client.set_channel(perfect_match_channel_id)
+                await self._client.set_channel(perfect_match_channel_id)
             elif partial_match_channel_id is not None:
                 _LOGGER.info(
                     "Switching to channel <%s> with partial match",
                     partial_match_channel_id,
                 )
-                self._client.set_channel(partial_match_channel_id)
+                await self._client.set_channel(partial_match_channel_id)
 
-            return
-
-    def media_play(self):
+    @cmd
+    def async_media_play(self):
         """Send play command."""
         self._playing = True
         self._state = STATE_PLAYING
-        self._client.play()
+        return self._client.play()
 
-    def media_pause(self):
+    @cmd
+    def async_media_pause(self):
         """Send media pause command to media player."""
         self._playing = False
         self._state = STATE_PAUSED
-        self._client.pause()
+        return self._client.pause()
 
-    def media_next_track(self):
+    @cmd
+    def async_media_next_track(self):
         """Send next track command."""
         current_input = self._client.get_input()
         if current_input == LIVETV_APP_ID:
-            self._client.channel_up()
+            return self._client.channel_up()
         else:
-            self._client.fast_forward()
+            return self._client.fast_forward()
 
-    def media_previous_track(self):
+    @cmd
+    def async_media_previous_track(self):
         """Send the previous track command."""
         current_input = self._client.get_input()
         if current_input == LIVETV_APP_ID:
-            self._client.channel_down()
+            return self._client.channel_down()
         else:
-            self._client.rewind()
+            return self._client.rewind()
+
+    @cmd
+    def async_command(self, command, command_type=None, command_data=None):
+        """Send generic command or button press."""
+        if command_type == "button":
+            return self._client.button(command)
+        else:
+            return self._client.request(command)
