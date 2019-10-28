@@ -612,7 +612,7 @@ class LgWebOSDevice(MediaPlayerDevice):
             return self._client.rewind()
 
     @cmd
-    def async_command(self, command, command_type=None, command_data=None):
+    def async_generic_command(self, command, command_type=None, command_data=None):
         """Send generic command or button press."""
         if command_type == "button":
             return self._client.button(command)
