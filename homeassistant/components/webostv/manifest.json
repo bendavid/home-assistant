@@ -3,7 +3,7 @@
   "name": "Webostv",
   "documentation": "https://www.home-assistant.io/integrations/webostv",
   "requirements": [
-    "pylgtv>=0.1.4",
+    "pylgtv==0.2.0",
     "websockets==8.0.2"
   ],
   "dependencies": ["configurator"],
