@@ -48,6 +48,7 @@ _LOGGER = logging.getLogger(__name__)
 
 CONF_SOURCES = "sources"
 CONF_ON_ACTION = "turn_on_action"
+CONF_STANDBY_CONNECTION = "standby_connection"
 
 DEFAULT_NAME = "LG webOS Smart TV"
 LIVETV_APP_ID = "com.webos.app.livetv"
@@ -82,7 +83,8 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_HOST): cv.string,
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_ON_ACTION): cv.SCRIPT_SCHEMA,
-        vol.Optional(CONF_TIMEOUT, default=1): cv.positive_int,
+        vol.Optional(CONF_TIMEOUT, default=2): cv.positive_int,
+        vol.Optional(CONF_STANDBY_CONNECTION, default=False): cv.boolean,
     }
 )
 
@@ -106,21 +108,40 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     customize = config.get(CONF_CUSTOMIZE)
     timeout = config.get(CONF_TIMEOUT)
     turn_on_action = config.get(CONF_ON_ACTION)
+    standby_connection = config.get(CONF_STANDBY_CONNECTION)
 
     config = hass.config.path(config.get(CONF_FILENAME))
 
     await async_setup_tv(
-        host, name, customize, config, timeout, hass, async_add_entities, turn_on_action
+        host,
+        name,
+        customize,
+        config,
+        timeout,
+        hass,
+        async_add_entities,
+        turn_on_action,
+        standby_connection,
     )
 
 
 async def async_setup_tv(
-    host, name, customize, config, timeout, hass, async_add_entities, turn_on_action
+    host,
+    name,
+    customize,
+    config,
+    timeout,
+    hass,
+    async_add_entities,
+    turn_on_action,
+    standby_connection,
 ):
     """Set up a LG WebOS TV based on host parameter."""
 
     # client = WebOsClient(host, config, timeout)
-    device = LgWebOSDevice(host, name, customize, config, timeout, hass, turn_on_action)
+    device = LgWebOSDevice(
+        host, name, customize, config, timeout, hass, turn_on_action, standby_connection
+    )
 
     if not device._client.is_registered():
         _LOGGER.warning("Not Paired")
@@ -168,7 +189,15 @@ async def async_setup_tv(
 
 
 async def async_request_configuration(
-    host, name, customize, config, timeout, hass, add_entities, turn_on_action
+    host,
+    name,
+    customize,
+    config,
+    timeout,
+    hass,
+    add_entities,
+    turn_on_action,
+    standby_connection,
 ):
     """Request configuration steps from the user."""
     configurator = hass.components.configurator
@@ -186,7 +215,15 @@ async def async_request_configuration(
     async def lgtv_configuration_callback(data):
         """Handle actions when configuration callback is called."""
         await async_setup_tv(
-            host, name, customize, config, timeout, hass, add_entities, turn_on_action
+            host,
+            name,
+            customize,
+            config,
+            timeout,
+            hass,
+            add_entities,
+            turn_on_action,
+            standby_connection,
         )
 
     _LOGGER.warning("adding host to configuring")
@@ -227,12 +264,26 @@ def cmd(func):
 class LgWebOSDevice(MediaPlayerDevice):
     """Representation of a LG WebOS TV."""
 
-    def __init__(self, host, name, customize, config, timeout, hass, on_action):
+    def __init__(
+        self,
+        host,
+        name,
+        customize,
+        config,
+        timeout,
+        hass,
+        on_action,
+        standby_connection,
+    ):
         """Initialize the webos device."""
         self.hass = hass
 
-        self._client = WebOsClient(host, config, timeout)
+        self._client = WebOsClient(
+            host, config, timeout_connect=timeout, ping_interval=None
+        )
+        self._client.set_disconnect_callback(self.async_handle_disconnect)
         self._on_script = Script(hass, on_action) if on_action else None
+        self._standby_connection = standby_connection
         self._customize = customize
 
         self._name = name
@@ -252,21 +303,35 @@ class LgWebOSDevice(MediaPlayerDevice):
 
     @property
     def should_poll(self):
-        """Only poll for state when client is not connected."""
-        return not self._client.is_connected()
+        """Poll for state-dependent connection monitoring."""
+        return True
 
     def setup(self):
         """Listen for Home Assistant stop event."""
 
-        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.disconnect)
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.async_disconnect)
 
-    async def disconnect(self, event):
+    async def async_disconnect(self, event):
         """Disconnect from TV."""
+        self._client.set_disconnect_callback(None)
         await self._client.disconnect()
+
+    async def async_handle_disconnect(self):
+        """Handle disconnect by setting state to off."""
+
+        if self._state != STATE_OFF:
+            self._state = STATE_OFF
+            self._current_source = None
+            self._current_source_id = None
+            self._channel = None
+
+            if self.entity_id is not None:
+                self.async_schedule_update_ha_state(False)
 
     async def async_subscribe_input_callback(self, current_input):
         """Handle subscribed updates to current input."""
         self._current_source_id = current_input
+        _LOGGER.warning(f"""self._current_source_id = {self._current_source_id}""")
 
         if self._current_source_id == "":
             self._state = STATE_OFF
@@ -351,6 +416,11 @@ class LgWebOSDevice(MediaPlayerDevice):
     async def async_update(self):
         """Connect and initialize state and update subscriptions."""
 
+        # _LOGGER.warning(f"""webostv async_update, connected = {self._client.is_connected()}""")
+
+        if self._client.is_connected():
+            if self._state != STATE_OFF:
+                await self._client.ping()
         if not self._client.is_connected():
             try:
                 await self._client.connect()
@@ -474,6 +544,7 @@ class LgWebOSDevice(MediaPlayerDevice):
             ):
                 return self._last_icon
             self._last_icon = icon
+            _LOGGER.warning(f"""new media image url: {icon}""")
             return icon
         return None
 
@@ -487,17 +558,22 @@ class LgWebOSDevice(MediaPlayerDevice):
     @cmd
     async def async_turn_off(self):
         """Turn off media player."""
+        _LOGGER.warning("webostv async_turn_off")
+
         try:
-            await self._client.power_off()
+            await self._client.power_off(disconnect=not self._standby_connection)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
 
-        self._state = STATE_OFF
-
-    def async_turn_on(self):
+    async def async_turn_on(self):
         """Turn on the media player."""
         if self._on_script:
-            return self._on_script.async_run()
+            await self._on_script.async_run()
+
+        # if connection was already active
+        # check if connection is still alive
+        if self._client.is_connected():
+            await self._client.ping()
 
     @cmd
     async def async_volume_up(self):
@@ -594,6 +670,11 @@ class LgWebOSDevice(MediaPlayerDevice):
         return self._client.pause()
 
     @cmd
+    def async_media_stop(self):
+        """Send stop command to media player."""
+        return self._client.stop()
+
+    @cmd
     def async_media_next_track(self):
         """Send next track command."""
         current_input = self._client.get_input()
@@ -616,5 +697,9 @@ class LgWebOSDevice(MediaPlayerDevice):
         """Send generic command or button press."""
         if command_type == "button":
             return self._client.button(command)
+        elif command_type == "launch_app":
+            return self._client.launch_app(command)
+        elif command_type == "set_input":
+            return self._client.set_input(command)
         else:
             return self._client.request(command)
