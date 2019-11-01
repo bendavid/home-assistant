@@ -175,6 +175,7 @@ async def async_setup_tv(
                 hass,
                 async_add_entities,
                 turn_on_action,
+                standby_connection,
             )
             return
 
