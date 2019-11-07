@@ -13,6 +13,7 @@ from pylgtv import PyLGTVPairException, PyLGTVCmdException
 import voluptuous as vol
 
 from homeassistant import util
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.components.media_player import MediaPlayerDevice, PLATFORM_SCHEMA
 from homeassistant.components.media_player.const import (
     MEDIA_TYPE_CHANNEL,
@@ -184,6 +185,7 @@ async def async_setup_tv(
         configurator = hass.components.configurator
         configurator.async_request_done(request_id)
 
+    device.setup()
     async_add_entities([device], update_before_add=False)
 
 
@@ -281,8 +283,8 @@ class LgWebOSDevice(MediaPlayerDevice):
             host,
             config,
             timeout_connect=timeout,
-            ping_interval=None,
-            disconnect_callback=self.async_handle_disconnect,
+            standby_connection=standby_connection,
+            ping_interval=10,
         )
         self._on_script = Script(hass, on_action) if on_action else None
         self._standby_connection = standby_connection
@@ -303,35 +305,46 @@ class LgWebOSDevice(MediaPlayerDevice):
         self._channel = None
         self._last_icon = None
 
+    def setup(self):
+        """Listen for hass shutdown event."""
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.disconnect)
+
     @property
     def should_poll(self):
-        """Poll for state-dependent connection monitoring."""
+        """Poll for auto connect."""
         return True
 
     async def async_added_to_hass(self):
-        """Connect and update state on home assistant start."""
+        """Connect and subscribe to state updates."""
+        await self._client.register_state_update_callback(
+            self.async_handle_state_update
+        )
         await self.async_update()
 
-    async def async_will_remove_from_hass(self):
+        # force state update if needed
+        if self._state is None:
+            await self.async_handle_state_update()
+
+    async def disconnect(self, event=None):
         """Disconnect on home assistant shutdown."""
+        self._client.unregister_state_update_callback(self.async_handle_state_update)
         await self._client.disconnect()
 
-    async def async_handle_disconnect(self):
-        """Handle disconnect by setting state to off."""
-        # print(f"""handling disconnect, hass is running = {self.hass.is_running}""")
+    async def async_will_remove_from_hass(self):
+        """Call disconnect on removal."""
+        await self.disconnect()
 
-        self._state = STATE_OFF
-        self._current_source = None
-        self._current_source_id = None
-        self._channel = None
+    async def async_handle_state_update(self):
+        """Update state from WebOsClient."""
+        self._current_source_id = self._client.current_appId
+        self._muted = self._client.muted
+        self._volume = self._client.volume
+        self._channel = self._client.current_channel
+        self._app_list = self._client.apps
+        self._input_list = self._client.inputs
 
-        if self.hass.is_running:
-            self.async_schedule_update_ha_state(False)
-
-    async def async_subscribe_input_callback(self, current_input):
-        """Handle subscribed updates to current input."""
-        self._current_source_id = current_input
-        _LOGGER.warning(f"""self._current_source_id = {self._current_source_id}""")
+        print(self._current_source_id)
+        print(self.hass.is_running)
 
         if self._current_source_id == "":
             self._state = STATE_OFF
@@ -339,40 +352,8 @@ class LgWebOSDevice(MediaPlayerDevice):
             self._state = STATE_PLAYING
 
         self.update_sources()
+
         self.async_schedule_update_ha_state(False)
-
-    async def async_subscribe_muted_callback(self, muted):
-        """Handle subscribed updates to mute status."""
-        self._muted = muted
-        self.async_schedule_update_ha_state(False)
-
-    async def async_subscribe_volume_callback(self, volume):
-        """Handle subscribed updates to volume status."""
-        self._volume = volume
-        self.async_schedule_update_ha_state(False)
-
-    async def async_subscribe_current_channel_callback(self, channel):
-        """Handle subscribed updates to current channel."""
-        self._channel = channel
-        self.async_schedule_update_ha_state(False)
-
-    async def async_subscribe_apps_callback(self, apps):
-        """Handle subscribed updates to apps list."""
-        self._app_list = {}
-        for app in apps:
-            self._app_list[app["id"]] = app
-
-        self.update_sources()
-        self.async_schedule_update_ha_state(True)
-
-    async def async_subscribe_inputs_callback(self, inputs):
-        """Handle subscribed updates to inputs list."""
-        self._input_list = {}
-        for extinput in inputs:
-            self._input_list[extinput["label"]] = extinput
-
-        self.update_sources()
-        self.async_schedule_update_ha_state(True)
 
     def update_sources(self):
         """Update list of sources from current source, apps, inputs and configured list."""
@@ -404,61 +385,13 @@ class LgWebOSDevice(MediaPlayerDevice):
 
     @util.Throttle(MIN_TIME_BETWEEN_SCANS, MIN_TIME_BETWEEN_FORCED_SCANS)
     async def async_update(self):
-        """Connect and initialize state and update subscriptions."""
+        """Connect."""
 
-        if self._client.is_connected():
-            if self._state != STATE_OFF:
-                await self._client.ping()
+        print("async_update")
+
         if not self._client.is_connected():
             try:
                 await self._client.connect()
-
-                # manually get state
-                results = await asyncio.gather(
-                    self._client.get_current_app(),
-                    self._client.get_muted(),
-                    self._client.get_volume(),
-                    self._client.get_current_channel(),
-                    self._client.get_apps(),
-                    self._client.get_inputs(),
-                )
-
-                self._current_source_id = results[0]
-
-                if self._current_source_id == "":
-                    self._state = STATE_OFF
-                else:
-                    self._state = STATE_PLAYING
-
-                self._muted = results[1]
-                self._volume = results[2]
-                self._channel = results[3]
-
-                self._app_list = {}
-                for app in results[4]:
-                    self._app_list[app["id"]] = app
-
-                self._input_list = {}
-                for extinput in results[5]:
-                    self._input_list[extinput["label"]] = extinput
-
-                self.update_sources()
-
-                # subscribe to updates
-                await self._client.subscribe_current_app(
-                    self.async_subscribe_input_callback
-                )
-                await self._client.subscribe_muted(self.async_subscribe_muted_callback)
-                await self._client.subscribe_volume(
-                    self.async_subscribe_volume_callback
-                )
-                await self._client.subscribe_current_channel(
-                    self.async_subscribe_current_channel_callback
-                )
-                await self._client.subscribe_apps(self.async_subscribe_apps_callback)
-                await self._client.subscribe_inputs(
-                    self.async_subscribe_inputs_callback
-                )
             except (
                 OSError,
                 ConnectionClosed,
@@ -468,11 +401,7 @@ class LgWebOSDevice(MediaPlayerDevice):
                 PyLGTVPairException,
                 PyLGTVCmdException,
             ):
-                await self._client.disconnect()
-                self._state = STATE_OFF
-                self._current_source = None
-                self._current_source_id = None
-                self._channel = None
+                pass
 
     @property
     def name(self):
@@ -546,21 +475,18 @@ class LgWebOSDevice(MediaPlayerDevice):
     async def async_turn_off(self):
         """Turn off media player."""
         _LOGGER.warning("webostv async_turn_off")
-
-        try:
-            await self._client.power_off(disconnect=not self._standby_connection)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            pass
+        await self._client.power_off()
 
     async def async_turn_on(self):
         """Turn on the media player."""
+        connected = self._client.is_connected()
         if self._on_script:
             await self._on_script.async_run()
 
         # if connection was already active
-        # check if connection is still alive
-        if self._client.is_connected():
-            await self._client.ping()
+        # ensure is still alive
+        if connected:
+            await self._client.get_current_app()
 
     @cmd
     async def async_volume_up(self):
