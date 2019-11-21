@@ -3,18 +3,12 @@ from functools import wraps
 import asyncio
 from datetime import timedelta
 import logging
-from urllib.parse import urlparse
-from typing import Dict
 from websockets.exceptions import ConnectionClosed
 
-from pylgtv import WebOsClient
 from pylgtv import PyLGTVPairException, PyLGTVCmdException
 
-import voluptuous as vol
-
 from homeassistant import util
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.components.media_player import MediaPlayerDevice, PLATFORM_SCHEMA
+from homeassistant.components.media_player import MediaPlayerDevice
 from homeassistant.components.media_player.const import (
     MEDIA_TYPE_CHANNEL,
     SUPPORT_NEXT_TRACK,
@@ -32,28 +26,21 @@ from homeassistant.components.media_player.const import (
 )
 from homeassistant.const import (
     CONF_CUSTOMIZE,
-    CONF_FILENAME,
     CONF_HOST,
     CONF_NAME,
-    CONF_TIMEOUT,
     STATE_OFF,
     STATE_PAUSED,
     STATE_PLAYING,
 )
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.script import Script
 
-_CONFIGURING: Dict[str, str] = {}
+from . import DOMAIN, CONF_ON_ACTION, CONF_SOURCES
+
 _LOGGER = logging.getLogger(__name__)
 
-CONF_SOURCES = "sources"
-CONF_ON_ACTION = "turn_on_action"
-CONF_STANDBY_CONNECTION = "standby_connection"
 
-DEFAULT_NAME = "LG webOS Smart TV"
 LIVETV_APP_ID = "com.webos.app.livetv"
 
-WEBOSTV_CONFIG_FILE = "webostv.conf"
 
 SUPPORT_WEBOSTV = (
     SUPPORT_TURN_OFF
@@ -72,169 +59,20 @@ SUPPORT_WEBOSTV = (
 MIN_TIME_BETWEEN_SCANS = timedelta(seconds=10)
 MIN_TIME_BETWEEN_FORCED_SCANS = timedelta(seconds=1)
 
-CUSTOMIZE_SCHEMA = vol.Schema(
-    {vol.Optional(CONF_SOURCES): vol.All(cv.ensure_list, [cv.string])}
-)
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Optional(CONF_CUSTOMIZE, default={}): CUSTOMIZE_SCHEMA,
-        vol.Optional(CONF_FILENAME, default=WEBOSTV_CONFIG_FILE): cv.string,
-        vol.Optional(CONF_HOST): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_ON_ACTION): cv.SCRIPT_SCHEMA,
-        vol.Optional(CONF_TIMEOUT, default=2): cv.positive_int,
-        vol.Optional(CONF_STANDBY_CONNECTION, default=False): cv.boolean,
-    }
-)
-
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the LG WebOS TV platform."""
-    if discovery_info is not None:
-        host = urlparse(discovery_info[1]).hostname
-    else:
-        host = config.get(CONF_HOST)
 
-    if host is None:
-        _LOGGER.error("No TV found in configuration file or with discovery")
-        return False
+    host = discovery_info.get(CONF_HOST)
+    name = discovery_info.get(CONF_NAME)
+    customize = discovery_info.get(CONF_CUSTOMIZE)
+    turn_on_action = discovery_info.get(CONF_ON_ACTION)
 
-    # Only act if we are not already configuring this host
-    if host in _CONFIGURING:
-        return
+    client = hass.data[DOMAIN][host]["client"]
 
-    name = config.get(CONF_NAME)
-    customize = config.get(CONF_CUSTOMIZE)
-    timeout = config.get(CONF_TIMEOUT)
-    turn_on_action = config.get(CONF_ON_ACTION)
-    standby_connection = config.get(CONF_STANDBY_CONNECTION)
+    device = LgWebOSMediaPlayerDevice(hass, client, name, customize, turn_on_action)
 
-    config = hass.config.path(config.get(CONF_FILENAME))
-
-    await async_setup_tv(
-        host,
-        name,
-        customize,
-        config,
-        timeout,
-        hass,
-        async_add_entities,
-        turn_on_action,
-        standby_connection,
-    )
-
-
-async def async_setup_tv(
-    host,
-    name,
-    customize,
-    config,
-    timeout,
-    hass,
-    async_add_entities,
-    turn_on_action,
-    standby_connection,
-):
-    """Set up a LG WebOS TV based on host parameter."""
-
-    # client = WebOsClient(host, config, timeout)
-    device = LgWebOSDevice(
-        host, name, customize, config, timeout, hass, turn_on_action, standby_connection
-    )
-
-    if not device._client.is_registered():
-        _LOGGER.warning("Not Paired")
-        if host in _CONFIGURING:
-            # Try to pair.
-            try:
-                await device._client.connect()
-                await device._client.disconnect()
-            except PyLGTVPairException:
-                _LOGGER.warning("Connected to LG webOS TV %s but not paired", host)
-                return
-            except (
-                OSError,
-                ConnectionClosed,
-                ConnectionRefusedError,
-                asyncio.TimeoutError,
-                asyncio.CancelledError,
-                PyLGTVCmdException,
-            ):
-                _LOGGER.error("Unable to connect to host %s", host)
-                return
-        else:
-            # Not registered, request configuration.
-            _LOGGER.warning("LG webOS TV %s needs to be paired", host)
-            await async_request_configuration(
-                host,
-                name,
-                customize,
-                config,
-                timeout,
-                hass,
-                async_add_entities,
-                turn_on_action,
-                standby_connection,
-            )
-            return
-
-    # If we came here and configuring this host, mark as done.
-    if device._client.is_registered() and host in _CONFIGURING:
-        request_id = _CONFIGURING.pop(host)
-        configurator = hass.components.configurator
-        configurator.async_request_done(request_id)
-
-    device.setup()
     async_add_entities([device], update_before_add=False)
-
-
-async def async_request_configuration(
-    host,
-    name,
-    customize,
-    config,
-    timeout,
-    hass,
-    add_entities,
-    turn_on_action,
-    standby_connection,
-):
-    """Request configuration steps from the user."""
-    configurator = hass.components.configurator
-
-    _LOGGER.warning("request configuration")
-
-    # We got an error if this method is called while we are configuring
-    if host in _CONFIGURING:
-        _LOGGER.warning("host in configuring")
-        await configurator.async_notify_errors(
-            _CONFIGURING[host], "Failed to pair, please try again."
-        )
-        return
-
-    async def lgtv_configuration_callback(data):
-        """Handle actions when configuration callback is called."""
-        await async_setup_tv(
-            host,
-            name,
-            customize,
-            config,
-            timeout,
-            hass,
-            add_entities,
-            turn_on_action,
-            standby_connection,
-        )
-
-    _LOGGER.warning("adding host to configuring")
-    _CONFIGURING[host] = configurator.async_request_config(
-        name,
-        lgtv_configuration_callback,
-        description="Click start and accept the pairing request on your TV.",
-        description_image="/static/images/config_webos.png",
-        submit_caption="Start pairing request",
-    )
 
 
 def cmd(func):
@@ -262,32 +100,21 @@ def cmd(func):
     return wrapper
 
 
-class LgWebOSDevice(MediaPlayerDevice):
+class LgWebOSMediaPlayerDevice(MediaPlayerDevice):
     """Representation of a LG WebOS TV."""
 
-    def __init__(
-        self,
-        host,
-        name,
-        customize,
-        config,
-        timeout,
-        hass,
-        on_action,
-        standby_connection,
-    ):
+    def __init__(self, hass, client, name, customize, on_action):
         """Initialize the webos device."""
+        # self._client = WebOsClient(
+        # host,
+        # config,
+        # timeout_connect=timeout,
+        # standby_connection=standby_connection,
+        # ping_interval=10,
+        # )
         self.hass = hass
-
-        self._client = WebOsClient(
-            host,
-            config,
-            timeout_connect=timeout,
-            standby_connection=standby_connection,
-            ping_interval=10,
-        )
+        self._client = client
         self._on_script = Script(hass, on_action) if on_action else None
-        self._standby_connection = standby_connection
         self._customize = customize
 
         self._name = name
@@ -305,10 +132,6 @@ class LgWebOSDevice(MediaPlayerDevice):
         self._channel = None
         self._last_icon = None
 
-    def setup(self):
-        """Listen for hass shutdown event."""
-        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.disconnect)
-
     @property
     def should_poll(self):
         """Poll for auto connect."""
@@ -316,23 +139,19 @@ class LgWebOSDevice(MediaPlayerDevice):
 
     async def async_added_to_hass(self):
         """Connect and subscribe to state updates."""
+        print("async_added_to_hass")
         await self._client.register_state_update_callback(
             self.async_handle_state_update
         )
-        await self.async_update()
+        # await self.async_update()
 
         # force state update if needed
         if self._state is None:
             await self.async_handle_state_update()
 
-    async def disconnect(self, event=None):
-        """Disconnect on home assistant shutdown."""
-        self._client.unregister_state_update_callback(self.async_handle_state_update)
-        await self._client.disconnect()
-
     async def async_will_remove_from_hass(self):
         """Call disconnect on removal."""
-        await self.disconnect()
+        self._client.unregister_state_update_callback(self.async_handle_state_update)
 
     async def async_handle_state_update(self):
         """Update state from WebOsClient."""

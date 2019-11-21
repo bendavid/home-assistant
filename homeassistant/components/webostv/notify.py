@@ -3,55 +3,24 @@ import logging
 import asyncio
 from websockets.exceptions import ConnectionClosed
 
-import voluptuous as vol
+from homeassistant.components.notify import ATTR_DATA, BaseNotificationService
+from homeassistant.const import CONF_HOST, CONF_ICON
 
-import homeassistant.helpers.config_validation as cv
-from homeassistant.components.notify import (
-    ATTR_DATA,
-    BaseNotificationService,
-    PLATFORM_SCHEMA,
-)
-from homeassistant.const import (
-    CONF_FILENAME,
-    CONF_HOST,
-    CONF_ICON,
-    EVENT_HOMEASSISTANT_STOP,
-)
+from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-
-WEBOSTV_CONFIG_FILE = "webostv.conf"
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Optional(CONF_FILENAME, default=WEBOSTV_CONFIG_FILE): cv.string,
-        vol.Optional(CONF_ICON): cv.string,
-    }
-)
 
 
 async def async_get_service(hass, config, discovery_info=None):
     """Return the notify service."""
-    from pylgtv import WebOsClient
-    from pylgtv import PyLGTVPairException
 
-    path = hass.config.path(config.get(CONF_FILENAME))
-    client = WebOsClient(config.get(CONF_HOST), key_file_path=path, timeout_connect=8)
+    host = discovery_info.get(CONF_HOST)
+    icon_path = discovery_info.get(CONF_ICON)
 
-    if not client.is_registered():
-        try:
-            await client.connect()
-            await client.disconnect()
-        except PyLGTVPairException:
-            _LOGGER.error("Pairing with TV failed")
-            return None
-        except OSError:
-            _LOGGER.error("TV unreachable")
-            return None
+    client = hass.data[DOMAIN][host]["client"]
 
-    svc = LgWebOSNotificationService(hass, client, config.get(CONF_ICON))
-    svc.setup()
+    svc = LgWebOSNotificationService(hass, client, icon_path)
+
     return svc
 
 
@@ -63,15 +32,6 @@ class LgWebOSNotificationService(BaseNotificationService):
         self.hass = hass
         self._client = client
         self._icon_path = icon_path
-
-    def setup(self):
-        """Listen for Home Assistant stop event."""
-
-        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.disconnect)
-
-    async def disconnect(self, event):
-        """Disconnect from TV."""
-        await self._client.disconnect()
 
     async def async_send_message(self, message="", **kwargs):
         """Send a message to the tv."""
